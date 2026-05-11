@@ -1,9 +1,12 @@
-dist/
-build/
 __pycache__/
 *.pyc
+
+build/
+dist/
+
 .venv/
 venv/
 env/
+
 .env
 *.log
