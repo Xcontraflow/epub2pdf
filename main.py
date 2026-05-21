@@ -4,6 +4,7 @@ Auto-selects best available system font (Inter > Segoe UI Variable > Segoe UI).
 """
 
 import os
+import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -11,6 +12,18 @@ from tkinter import filedialog, messagebox
 from pathlib import Path
 
 import customtkinter as ctk
+from PIL import Image, ImageTk
+
+# Windows taskbar grouping: distinct AppUserModelID so taskbar uses our icon,
+# not the host pythonw.exe icon. Must run BEFORE first Tk window is created.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "epub2pdf.app.1"
+        )
+    except Exception:
+        pass
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -37,14 +50,293 @@ def _pick_font() -> str:
     return "TkDefaultFont"
 
 
+class FontPicker(ctk.CTkFrame):
+    """Entry + dropdown button. Dropdown is tk.Listbox = native mouse-wheel scroll."""
+
+    def __init__(self, master, variable: tk.StringVar, values: list[str],
+                 ui_font: str, item_size: int = 18, height: int = 38):
+        # Outer is the unified rounded rectangle container
+        super().__init__(
+            master, fg_color=INPBG, border_color=BORDER, border_width=1,
+            corner_radius=8, height=height,
+        )
+        self.pack_propagate(False)
+
+        self._values_all = values
+        self._var = variable
+        self._ui_font = ui_font
+        self._item_size = item_size
+        self._height = height
+        self._popup: tk.Toplevel | None = None
+        self._listbox: tk.Listbox | None = None
+        self._root_click_bind_id: str | None = None
+        self._chev_color = TEXT
+
+        # ── Chevron canvas (right side, inside the rounded container) ────
+        chev_w = 36
+        self._canvas = tk.Canvas(
+            self, bg=INPBG, highlightthickness=0, bd=0,
+            width=chev_w, height=height - 4, cursor="hand2",
+        )
+        self._canvas.pack(side="right", padx=(0, 6), pady=2)
+        self._canvas.bind("<Configure>", lambda _e: self._draw_chevron())
+        self._canvas.bind("<Button-1>", lambda _e: self._toggle())
+        self._canvas.bind("<Enter>", lambda _e: self._set_chev_hover(True))
+        self._canvas.bind("<Leave>", lambda _e: self._set_chev_hover(False))
+
+        # ── Entry (no own border, blends into rounded container) ─────────
+        self.entry = ctk.CTkEntry(
+            self, textvariable=variable,
+            font=ctk.CTkFont(ui_font, 15),
+            fg_color=INPBG, border_width=0,
+            text_color=TEXT, corner_radius=0, height=height - 6,
+        )
+        self.entry.pack(side="left", fill="both", expand=True,
+                        padx=(10, 2), pady=3)
+
+        self.entry.bind("<KeyRelease>", self._on_key)
+        self.entry.bind("<FocusIn>", lambda _e: self._open())
+        self.entry.bind("<Down>", lambda _e: (self._open(), self._focus_list()))
+
+    # ── Backward-compat: code reads self.btn.winfo_width() for popup sizing
+    @property
+    def btn(self):
+        return self._canvas
+
+    def _set_chev_hover(self, on: bool) -> None:
+        self._chev_color = ACCENT if on else TEXT
+        self._draw_chevron()
+
+    def _draw_chevron(self) -> None:
+        self._canvas.delete("all")
+        w = self._canvas.winfo_width()
+        h = self._canvas.winfo_height()
+        if w < 4 or h < 4:
+            return
+        cx, cy = w // 2, h // 2
+        r = 8   # chevron half-width
+        d = 4   # chevron half-height
+        # Two strokes forming a "v"
+        self._canvas.create_line(
+            cx - r, cy - d, cx, cy + d,
+            fill=self._chev_color, width=3, capstyle="round",
+        )
+        self._canvas.create_line(
+            cx, cy + d, cx + r, cy - d,
+            fill=self._chev_color, width=3, capstyle="round",
+        )
+
+    def _toggle(self) -> None:
+        if self._popup and self._popup.winfo_exists():
+            self._close()
+        else:
+            self._open()
+
+    def _open(self) -> None:
+        if self._popup and self._popup.winfo_exists():
+            return
+        self.update_idletasks()
+        x = self.entry.winfo_rootx()
+        y = self.entry.winfo_rooty() + self.entry.winfo_height() + 2
+        w = self.entry.winfo_width() + self.btn.winfo_width() + 6
+        h = 380
+
+        self._popup = tk.Toplevel(self)
+        self._popup.overrideredirect(True)
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+        self._popup.configure(bg=BORDER)
+
+        inner = tk.Frame(self._popup, bg=INPBG)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self._listbox = tk.Listbox(
+            inner, font=(self._ui_font, self._item_size),
+            bg=INPBG, fg=TEXT, selectbackground=ACCENT,
+            selectforeground="white", bd=0, highlightthickness=0,
+            activestyle="none", relief="flat",
+        )
+        sb = tk.Scrollbar(inner, command=self._listbox.yview, width=12)
+        self._listbox.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._listbox.pack(side="left", fill="both", expand=True)
+
+        self._refresh()
+
+        self._listbox.bind("<ButtonRelease-1>", self._on_pick)
+        self._listbox.bind("<Return>", self._on_pick)
+        self._listbox.bind("<Escape>", lambda _e: self._close())
+
+        # ── Global click detection: close on click outside popup/button ──
+        root = self.winfo_toplevel()
+        self._root_click_bind_id = root.bind(
+            "<Button-1>", self._on_global_click, add="+"
+        )
+
+    def _focus_list(self) -> None:
+        if self._listbox and self._listbox.size() > 0:
+            self._listbox.focus_set()
+            self._listbox.selection_set(0)
+            self._listbox.activate(0)
+
+    def _refresh(self) -> None:
+        """Populate listbox with full font list. Scroll/select to match current value."""
+        if not self._listbox:
+            return
+        self._listbox.delete(0, "end")
+        for v in self._values_all:
+            self._listbox.insert("end", v)
+        self._jump_to(self._var.get())
+
+    def _jump_to(self, query: str) -> None:
+        """Find first font matching query, select + scroll to it. Full list stays."""
+        if not self._listbox or not query:
+            return
+        q = query.strip().lower()
+        if not q:
+            return
+        # Prefer prefix match, fallback to substring match
+        idx = None
+        for i, v in enumerate(self._values_all):
+            if v.lower().startswith(q):
+                idx = i
+                break
+        if idx is None:
+            for i, v in enumerate(self._values_all):
+                if q in v.lower():
+                    idx = i
+                    break
+        if idx is None:
+            return
+        self._listbox.selection_clear(0, "end")
+        self._listbox.selection_set(idx)
+        self._listbox.activate(idx)
+        # Center the match in visible viewport
+        self._listbox.see(idx)
+        try:
+            total = len(self._values_all)
+            # Push so match sits near middle of viewport (~5 rows above)
+            top = max(0, idx - 5)
+            self._listbox.yview_moveto(top / total)
+        except Exception:
+            pass
+
+    def _on_key(self, _e) -> None:
+        self._open()
+        self._jump_to(self._var.get())
+
+    def _on_pick(self, _e) -> None:
+        if not self._listbox:
+            return
+        sel = self._listbox.curselection()
+        if sel:
+            self._var.set(self._listbox.get(sel[0]))
+        self._close()
+        self.entry.focus_set()
+
+    def _on_global_click(self, event) -> None:
+        """Close popup if click lands outside popup, entry, or dropdown button."""
+        if not self._popup or not self._popup.winfo_exists():
+            return
+        x, y = event.x_root, event.y_root
+
+        def inside(widget) -> bool:
+            try:
+                wx = widget.winfo_rootx()
+                wy = widget.winfo_rooty()
+                ww = widget.winfo_width()
+                wh = widget.winfo_height()
+                return wx <= x <= wx + ww and wy <= y <= wy + wh
+            except Exception:
+                return False
+
+        if inside(self._popup) or inside(self.entry) or inside(self._canvas) or inside(self):
+            return
+        self._close()
+
+    def _close(self) -> None:
+        if self._root_click_bind_id is not None:
+            try:
+                self.winfo_toplevel().unbind("<Button-1>", self._root_click_bind_id)
+            except Exception:
+                pass
+            self._root_click_bind_id = None
+        if self._popup and self._popup.winfo_exists():
+            self._popup.destroy()
+        self._popup = None
+        self._listbox = None
+
+
+# 0 = transparent (rounded corner), 1 = orange bg, 2 = white arrow
+_ICON_GRID = [
+    [0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0],
+    [0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,2,2,1,1,1],
+    [1,1,1,1,1,1,1,2,2,2,2,2,2,2,1,1],
+    [1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,1],
+    [1,1,1,1,1,1,1,2,2,2,2,2,2,2,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,2,2,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0],
+    [0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0],
+]
+
+
+def _render_app_icon(size: int) -> Image.Image:
+    """Pixel art icon — NEAREST scaling, rounded corners, same as desktop icon."""
+    _ACCENT = (212, 119, 74, 255)
+    _WHITE  = (255, 255, 255, 255)
+    img = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+    pix = img.load()
+    for r, row in enumerate(_ICON_GRID):
+        for c, val in enumerate(row):
+            if val == 1:
+                pix[c, r] = _ACCENT
+            elif val == 2:
+                pix[c, r] = _WHITE
+    return img.resize((size, size), Image.NEAREST)
+
+
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("EPUB → PDF")
-        self.geometry("780x660")
-        self.minsize(660, 580)
+        w, h = 660, 620
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(560, 500)
         self.configure(fg_color=BG)
         self.resizable(True, True)
+
+        # Window + taskbar icon. icon.ico for window decoration / system tray.
+        # wm_iconphoto sets the icon Windows uses in the taskbar (256x256 PNG
+        # path gives crisp rendering at any DPI).
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_dir, "icon.ico")
+        if os.path.isfile(icon_path):
+            try:
+                # default=True → all future Toplevel windows inherit this icon
+                self.iconbitmap(default=icon_path)
+            except Exception:
+                try:
+                    self.iconbitmap(icon_path)
+                except Exception:
+                    pass
+        try:
+            # High-res PNG for taskbar (iconbitmap alone sometimes leaves
+            # the small taskbar icon stale; iconphoto forces refresh).
+            self._taskbar_icon = ImageTk.PhotoImage(_render_app_icon(256))
+            self.wm_iconphoto(True, self._taskbar_icon)
+        except Exception:
+            pass
 
         self._UF = _pick_font()          # UI font family
         self._all_fonts: list[str] = sorted(set(tkfont.families()), key=str.lower)
@@ -61,7 +353,13 @@ class App(ctk.CTk):
         self.status_var = tk.StringVar(value="选择 EPUB 文件开始转换")
 
         self._build()
-        self._center()
+        self.after(100, self._force_show)
+
+    def _force_show(self) -> None:
+        self.lift()
+        self.focus_force()
+        self.attributes("-topmost", True)
+        self.after(500, lambda: self.attributes("-topmost", False))
 
     # ── Shorthand font constructors ───────────────────────────────────────────
 
@@ -76,14 +374,14 @@ class App(ctk.CTk):
 
     def _build(self) -> None:
         main = ctk.CTkFrame(self, fg_color=BG)
-        main.pack(fill="both", expand=True, padx=48, pady=40)
+        main.pack(fill="both", expand=True, padx=28, pady=22)
 
         self._header(main)
-        self._sep(main, top=24, bot=24)
+        self._sep(main, top=16, bot=16)
         self._file_section(main)
-        self._sep(main, top=22, bot=22)
+        self._sep(main, top=14, bot=14)
         self._font_section(main)
-        self._sep(main, top=22, bot=22)
+        self._sep(main, top=14, bot=14)
         self._page_section(main)
         self._action_section(main)
 
@@ -93,25 +391,24 @@ class App(ctk.CTk):
         row = ctk.CTkFrame(p, fg_color="transparent")
         row.pack(fill="x")
 
-        # Canvas icon: orange circle + white arrow
-        size = 44
+        # Canvas icon: pixel art at 48px (3× of 16px base = perfect NEAREST scale)
+        size = 48
+        pil_img = _render_app_icon(size)
+        self._header_icon = ImageTk.PhotoImage(pil_img)
         c = tk.Canvas(row, width=size, height=size,
                        bg=BG, highlightthickness=0)
-        c.pack(side="left")
-        c.create_oval(2, 2, size - 2, size - 2, fill=ACCENT, outline="")
-        c.create_text(size // 2, size // 2 + 1, text="→",
-                       fill="white",
-                       font=(self._UF, 18, "bold"))
+        c.pack(side="left", padx=(0, 4))
+        c.create_image(0, 0, anchor="nw", image=self._header_icon)
 
         title_col = tk.Frame(row, bg=BG)
         title_col.pack(side="left", padx=14)
 
         tk.Label(title_col, text="EPUB  →  PDF",
                   bg=BG, fg=TEXT,
-                  font=self._tf(22, "bold")).pack(anchor="w")
+                  font=self._tf(26, "bold")).pack(anchor="w")
         tk.Label(title_col, text="电子书转 PDF 转换器",
                   bg=BG, fg=SUB,
-                  font=self._tf(12)).pack(anchor="w")
+                  font=self._tf(15)).pack(anchor="w")
 
     def _sep(self, p, top: int = 16, bot: int = 16) -> None:
         ctk.CTkFrame(p, fg_color=BORDER, height=1).pack(
@@ -119,7 +416,7 @@ class App(ctk.CTk):
 
     def _section_lbl(self, p, text: str) -> None:
         tk.Label(p, text=text, bg=BG, fg=SUB,
-                  font=self._tf(10), anchor="w").pack(anchor="w", pady=(0, 10))
+                  font=self._tf(14, "bold"), anchor="w").pack(anchor="w", pady=(0, 8))
 
     # ── File section ──────────────────────────────────────────────────────────
 
@@ -135,17 +432,17 @@ class App(ctk.CTk):
             ctk.CTkEntry(
                 row, textvariable=var,
                 placeholder_text=placeholder,
-                font=self._f(12),
+                font=self._f(15),
                 fg_color=INPBG, border_color=BORDER, border_width=1,
                 text_color=TEXT, placeholder_text_color="#A1A1AA",
-                corner_radius=8, height=44,
+                corner_radius=8, height=38,
             ).pack(side="left", fill="x", expand=True, padx=(0, 10))
             ctk.CTkButton(
                 row, text="选择", command=cmd,
-                font=self._f(12),
+                font=self._f(15),
                 fg_color=INPBG, hover_color="#F0EDEA",
                 text_color=TEXT, border_width=1, border_color=BORDER,
-                corner_radius=8, height=44, width=68,
+                corner_radius=8, height=38, width=68,
             ).pack(side="right")
 
     # ── Font section ──────────────────────────────────────────────────────────
@@ -169,36 +466,16 @@ class App(ctk.CTk):
                        padx=(0, 18) if col < 2 else 0)
 
             tk.Label(cell, text=lbl, bg=BG, fg=SUB,
-                      font=self._tf(10), anchor="w").pack(anchor="w", pady=(0, 5))
+                      font=self._tf(13), anchor="w").pack(anchor="w", pady=(0, 5))
 
-            combo = ctk.CTkComboBox(
+            picker = FontPicker(
                 cell, variable=var, values=self._all_fonts,
-                font=self._f(12),
-                fg_color=INPBG, border_color=BORDER, border_width=1,
-                button_color=BORDER, button_hover_color="#D4D4D8",
-                dropdown_fg_color=INPBG, dropdown_hover_color="#F4F4F5",
-                dropdown_text_color=TEXT,
-                dropdown_font=self._f(12),
-                text_color=TEXT, corner_radius=8, height=44,
-                command=lambda _v, t=tag: None,
+                ui_font=self._UF, item_size=18, height=38,
             )
-            combo.pack(fill="x")
+            picker.pack(fill="x")
 
             self._var_map[tag] = var
-            setattr(self, f"_combo_{tag}", combo)
-
-            try:
-                combo._entry.bind("<KeyRelease>",
-                                   lambda _e, t=tag: self._filter_fonts(t))
-            except AttributeError:
-                pass
-
-    def _filter_fonts(self, tag: str) -> None:
-        var   = self._var_map[tag]
-        combo = getattr(self, f"_combo_{tag}")
-        q     = var.get().lower().strip()
-        hits  = [f for f in self._all_fonts if q in f.lower()] if q else self._all_fonts
-        combo.configure(values=hits or self._all_fonts)
+            setattr(self, f"_combo_{tag}", picker)
 
     # ── Page section ──────────────────────────────────────────────────────────
 
@@ -224,16 +501,16 @@ class App(ctk.CTk):
         mg = tk.Frame(grid, bg=BG)
         mg.grid(row=0, column=2, sticky="ew")
         tk.Label(mg, text="页边距", bg=BG, fg=SUB,
-                  font=self._tf(10), anchor="w").pack(anchor="w", pady=(0, 5))
+                  font=self._tf(13), anchor="w").pack(anchor="w", pady=(0, 5))
         self._margin_buttons(mg)
 
     def _slider_cell(self, parent, lbl: str, var, lo, hi, fmt_fn) -> None:
         tk.Label(parent, text=lbl, bg=BG, fg=SUB,
-                  font=self._tf(10), anchor="w").pack(anchor="w", pady=(0, 5))
+                  font=self._tf(13), anchor="w").pack(anchor="w", pady=(0, 5))
 
         val_lbl = tk.Label(parent, text=fmt_fn(var.get()),
                             bg=BG, fg=TEXT,
-                            font=self._tf(18, "bold"), anchor="w")
+                            font=self._tf(22, "bold"), anchor="w")
         val_lbl.pack(anchor="w")
 
         ctk.CTkSlider(
@@ -267,7 +544,7 @@ class App(ctk.CTk):
                 wrap, text=ch, cursor="hand2",
                 bg=ACCENT if ch == self.margin_var.get() else INPBG,
                 fg="white" if ch == self.margin_var.get() else TEXT,
-                font=self._tf(10),
+                font=self._tf(13, "bold"),
                 padx=9, pady=6,
             )
             btn.pack()
@@ -279,22 +556,22 @@ class App(ctk.CTk):
     def _action_section(self, p) -> None:
         self.convert_btn = ctk.CTkButton(
             p, text="开始转换",
-            font=self._f(14, "bold"),
+            font=self._f(17, "bold"),
             fg_color=ACCENT, hover_color=ACCH,
             text_color="white", corner_radius=8,
-            height=50, command=self._on_convert,
+            height=46, command=self._on_convert,
         )
-        self.convert_btn.pack(fill="x", pady=(28, 16))
+        self.convert_btn.pack(fill="x", pady=(20, 12))
 
         self._pb = ctk.CTkProgressBar(
             p, fg_color=TRACK, progress_color=ACCENT,
             corner_radius=3, height=4,
         )
-        self._pb.pack(fill="x", pady=(0, 10))
+        self._pb.pack(fill="x", pady=(0, 8))
         self._pb.set(0)
 
         ctk.CTkLabel(p, textvariable=self.status_var,
-                      font=self._f(11),
+                      font=self._f(14),
                       text_color=SUB, anchor="w").pack(fill="x")
 
     # ── Handlers ─────────────────────────────────────────────────────────────
@@ -369,12 +646,23 @@ class App(ctk.CTk):
                                     f"PDF 已保存至:\n{out}\n\n是否立即打开?"):
                 os.startfile(out)
 
-    def _center(self) -> None:
-        self.update_idletasks()
-        w, h   = self.winfo_width(), self.winfo_height()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        App().mainloop()
+    except Exception:
+        import traceback
+        log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "crash.log"
+        )
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(traceback.format_exc())
+        except Exception:
+            pass
+        try:
+            from tkinter import messagebox
+            messagebox.showerror("启动失败", traceback.format_exc())
+        except Exception:
+            pass
